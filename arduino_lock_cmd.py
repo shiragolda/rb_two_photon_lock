@@ -12,25 +12,33 @@ import threading
 
 #N_STEPS = 800  # number of voltage steps per scan
 
+def ToVoltage(bits):
+    return float((bits)/6553.6)
 
+def ToBits(voltage):
+    return int((voltage*6553.6))
 
 ZEROV = 32768
 
-params_default = (3200,
-                  2500., 1000.,0.00,
+params_default = (1,
+                  0.05,0.05,0.005,
                   ZEROV,
                   1,
-                  800)
+                  20.547,
+                  0.1,
+                  ToBits(3.0)+ZEROV)
 
-params_struct_size = 4*3+4*4
-params_struct_fmt = '<'+'ifffiii'
+params_struct_size = 4*9
+params_struct_fmt = '<'+'ffffiiffi'
 
 """
-params =    int ramp amplitude [0]
+params =    float ramp amplitude [0]
             float gain_p, gain_i, gain_i2 [1],[2],[3]
             int output_offset [4]
             int scan_state [5]
-            int n_steps [6]
+            float ramp_frequency [6]
+            fwhm [7]
+            lock_point [8]
 """
 
 p_state = 0
@@ -106,11 +114,7 @@ class zmq_pub_dict:
 
 #publisher = zmq_pub_dict(5553,'cs_laser')
 
-def ToVoltage(bits):
-    return float(bits/6553.6)
 
-def ToBits(voltage):
-    return int((voltage*6553.6))
 
 class CsLock:
     """Control the arduino set up for laser locking.
@@ -120,17 +124,19 @@ class CsLock:
     """
 
 
-    def __init__(self, serialport='/dev/ttyACM0'):
+    def __init__(self, serialport='/dev/ttyUSB0'):
         self.serialport = serialport
         self.ser = serial.Serial(serialport, baudrate=115200, timeout=6.0)
         print("Connection to Arduino established at port %s"%self.ser.name)
         time.sleep(4)  # wait for microcontroller to reboot
         self.params = list(params_default)
         self.set_params()
-        
+        print(self.ser.isOpen())
         time.sleep(0.1)
-
-
+    
+    def default_params(self):
+        self.params = list(params_default)
+        self.set_params()
 
     def idn(self):
         """Read id of the microcontroller and return read string."""
@@ -148,9 +154,9 @@ class CsLock:
         write_string = b'g'
         self.ser.write(write_string)
         data = self.ser.read(params_struct_size)
-        print(data)
+        #print(data)
         data_tuple = struct.unpack(params_struct_fmt, data)
-        print(data_tuple)
+        #print(data_tuple)
         self.params = list(data_tuple)
         return data_tuple
 
@@ -173,10 +179,7 @@ class CsLock:
             err = 0
             corr = 0
         return err,corr
-    def update_amplitude(self,new_amp):
-        new_amp = ToBits(new_amp)
-        self.params[0] = int(new_amp - new_amp % self.params[6])
-        self.set_params()
+
 
     def close(self):
         self.ser.close()
@@ -184,27 +187,35 @@ class CsLock:
 
 def print_params():
         """ Print the current parameters on the microcontroller. """
-        print('Ramp amplitude = {0:.3f} V,'.format(ToVoltage(cslock.params[0])))
-        print("Output pffset = {0:.3f} V".format(ToVoltage(cslock.params[4]-ZEROV)))
-        print('Servo Gain Parameters: P = {0:.0f}, I = {1:.0f}, I2 = {2:.0f}'.format(cslock.params[1],cslock.params[2],cslock.params[3]))
+        print('Ramp amplitude = {0:.3f} V'.format(cslock.params[0]))
+        print('Ramp frequency = {0:.3f} Hz'.format(cslock.params[6]))
+        print("Output offset = {0:.3f} V".format(ToVoltage(cslock.params[4]-ZEROV)))
+        print('Servo Gain Parameters: P = {0:.3f}, I = {1:.3f}, I2 = {2:.3f}'.format(cslock.params[1],cslock.params[2],cslock.params[3]))
         print('Scan On/Off: {0:.0f}'.format(cslock.params[5]))
+        print('Lock point: {0:.2f} V'.format(ToVoltage(cslock.params[8]-ZEROV)))
+        print("FWHM: %.3f V"%cslock.params[7])
 
 def scan_amp(new_amplitude):
-    """Set scan amplitude on the microcontroller in Volts.
-    Scan amplitude will be made a multiple of N_STEPS."""
-    cslock.update_amplitude(new_amplitude)
+    """Set scan amplitude on the microcontroller in Volts."""
+    cslock.params[0] = new_amplitude
+    cslock.set_params()
 
-def scan_steps(new_steps): # what does this do
-    cslock.params[6] = int(new_steps)
-    old_amplitude = cslock.params[0]
-    cslock.update_amplitude(ToVoltage(old_amplitude))
+def scan_freq(new_freq):
+    """Set scan frequency on the microscontroller in Hz """
+    cslock.params[6] = new_freq
+    cslock.set_params()
+    
+def set_lock_point(new_lp):
+    cslock.params[8] = ToBits(new_lp)+ZEROV
+    cslock.set_params()
 
 def lock():
     global p_state,i_state,i2_state
     cslock.set_scan_state(0)
-    lockpoint = cslock.ser.readline()
+    lockpoint = ToVoltage(int(cslock.ser.readline())-ZEROV)
     print(lockpoint)
     print("Locked")
+    cslock.get_params()
 
 def unlock():
     cslock.set_scan_state(1)
@@ -236,24 +247,28 @@ def output_offset(offset):
     cslock.set_params()
 
 def increase_offset():
-    cslock.params[4] += int(ToBits(0.002))
+    cslock.params[4] += int(ToBits(0.1))
     cslock.set_params()
 
 def decrease_offset():
-    cslock.params[4] -= int(ToBits(0.002))
+    cslock.params[4] -= int(ToBits(0.1))
     cslock.set_params()
 
-def scan_freq_nsteps(n_steps):
-    """ Set the number of steps"""
-    cslock.params[6] = int(n_steps)
+def fwhm(new_fwhm):
+    cslock.params[7] = new_fwhm
     cslock.set_params()
+
+#def scan_freq_nsteps(n_steps):
+#    """ Set the number of steps"""
+#    cslock.params[6] = int(n_steps)
+#    cslock.set_params()
     
-def scan_freq(frequency):
-    """ Set the frequecncy in Hz """
-    freq_to_steps = 10.5263157895 #conversion between frequency and n steps in units steps/Hz
-    new_steps = int(round(freq_to_steps*frequency))
-    cslock.params[6] = int(new_steps)
-    cslock.set_params()
+# def scan_freq(frequency):
+#     """ Set the frequecncy in Hz """
+#     freq_to_steps = 10.5263157895 #conversion between frequency and n steps in units steps/Hz
+#     new_steps = int(round(freq_to_steps*frequency))
+#     cslock.params[6] = int(new_steps)
+#     cslock.set_params()
 
 # def publish_data():
 #     publisher = zmq_pub_dict(5553,'cs_laser')
@@ -281,9 +296,9 @@ def scan_freq(frequency):
 #     publishOn()
 #     loop_running = True
 
-if __name__ == '__main__':
-    cslock = CsLock()
-    
+#if __name__ == '__main__':
+#    cslock = CsLock()
+
 cslock = CsLock()
 
 # loop_running = True
@@ -318,4 +333,4 @@ cslock = CsLock()
 #         break
 
 #publisher.close()
-cslock.close()
+#cslock.close()
