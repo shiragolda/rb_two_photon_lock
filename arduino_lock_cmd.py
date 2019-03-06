@@ -20,16 +20,18 @@ def ToBits(voltage):
 
 ZEROV = 32768
 
-params_default = (1,
-                  0.05,0.05,0.005,
+params_default = (1.0,
+                  0.05,1e-3,0.01,
                   ZEROV,
                   1,
-                  20.547,
-                  0.1,
-                  ToBits(3.0)+ZEROV)
+                  201.21,
+                  0.300,
+                  ToBits(3.0)+ZEROV,
+                  4,
+                  0.05)
 
-params_struct_size = 4*9
-params_struct_fmt = '<'+'ffffiiffi'
+params_struct_size = 4*11
+params_struct_fmt = '<'+'ffffiiffiif'
 
 """
 params =    float ramp amplitude [0]
@@ -39,7 +41,11 @@ params =    float ramp amplitude [0]
             float ramp_frequency [6]
             fwhm [7]
             lock_point [8]
+            n_averages [9]
+            alpha [10]
 """
+
+    
 
 p_state = 0
 i_state = 0
@@ -116,7 +122,7 @@ class zmq_pub_dict:
 
 
 
-class CsLock:
+class ArduinoLocker:
     """Control the arduino set up for laser locking.
 
     Requires:
@@ -131,8 +137,8 @@ class CsLock:
         time.sleep(4)  # wait for microcontroller to reboot
         self.params = list(params_default)
         self.set_params()
-        print(self.ser.isOpen())
         time.sleep(0.1)
+        self.print_params()
     
     def default_params(self):
         self.params = list(params_default)
@@ -156,14 +162,23 @@ class CsLock:
         data = self.ser.read(params_struct_size)
         #print(data)
         data_tuple = struct.unpack(params_struct_fmt, data)
-        #print(data_tuple)
-        self.params = list(data_tuple)
+        #sanity check: sometimes the arduino returns garbage
+        if(data_tuple[4]<65536 and data_tuple[4]>0 and data_tuple[5]<=1 and data_tuple[5]>=0 and data_tuple[6]<65536 and data_tuple[6]>0):
+            self.params = list(data_tuple)
+            return data_tuple
+        else:
+            print("Inappropriate data fetched")
+            self.set_params()
+            return self.params
         return data_tuple
 
     def set_params(self):
         """Set params on the microcontroller."""
         data = struct.pack(params_struct_fmt, *self.params)
         self.ser.write(b's'+data)
+        time.sleep(0.1)
+        s = self.ser.readline()
+        print(s)
 
     def set_scan_state(self,scan_state):
         self.params[5] = int(scan_state)
@@ -180,83 +195,104 @@ class CsLock:
             corr = 0
         return err,corr
 
+        
+    def get_sampling_rate(self):
+        self.ser.write(b't')
+        sampling_time = self.ser.readline()
+        print("Loop period: %i us"%int(sampling_time))
 
     def close(self):
         self.ser.close()
 
 
-def print_params():
+    def print_params(self):
+        self.get_params()
         """ Print the current parameters on the microcontroller. """
-        print('Ramp amplitude = {0:.3f} V'.format(cslock.params[0]))
-        print('Ramp frequency = {0:.3f} Hz'.format(cslock.params[6]))
-        print("Output offset = {0:.3f} V".format(ToVoltage(cslock.params[4]-ZEROV)))
-        print('Servo Gain Parameters: P = {0:.3f}, I = {1:.3f}, I2 = {2:.3f}'.format(cslock.params[1],cslock.params[2],cslock.params[3]))
-        print('Scan On/Off: {0:.0f}'.format(cslock.params[5]))
-        print('Lock point: {0:.2f} V'.format(ToVoltage(cslock.params[8]-ZEROV)))
-        print("FWHM: %.3f V"%cslock.params[7])
-
-def scan_amp(new_amplitude):
-    """Set scan amplitude on the microcontroller in Volts."""
-    cslock.params[0] = new_amplitude
-    cslock.set_params()
-
-def scan_freq(new_freq):
-    """Set scan frequency on the microscontroller in Hz """
-    cslock.params[6] = new_freq
-    cslock.set_params()
+        print('Ramp amplitude = {0:.3f} V'.format(self.params[0]))
+        print('Ramp frequency = {0:.3f} Hz'.format(self.params[6]))
+        print("Output offset = {0:.3f} V".format(ToVoltage(self.params[4]-ZEROV)))
+        print('Servo Gain Parameters: P = {0:.3f}, I = {1:.3e}, I2 = {2:.3e}'.format(self.params[1],self.params[2],self.params[3]))
+        print('Scan On/Off: {0:.0f}'.format(self.params[5]))
+        print('Lock point: {0:.2f} V'.format(ToVoltage(self.params[8]-ZEROV)))
+        print("FWHM: %.3f V"%self.params[7])
+        print("N averages: %i"%self.params[9])
+        print("Alpha : %.3f"%(self.params[10]))
     
-def set_lock_point(new_lp):
-    cslock.params[8] = ToBits(new_lp)+ZEROV
-    cslock.set_params()
+    def scan_amp(self,new_amplitude):
+        """Set scan amplitude on the microcontroller in Volts."""
+        self.params[0] = new_amplitude
+        self.set_params()
+    
+    def scan_freq(self,new_freq):
+        """Set scan frequency on the microscontroller in Hz """
+        self.params[6] = new_freq
+        self.set_params()
+        
+    def set_lock_point(self,new_lp):
+        self.params[8] = ToBits(new_lp)+ZEROV
+        self.set_params()
+    
+    def lock(self):
+        global p_state,i_state,i2_state
+        self.set_scan_state(0)
+        #lockpoint = ToVoltage(int(self.ser.readline())-ZEROV)
+        #print(lockpoint)
+        print("Locked")
+    
+    def unlock(self):
+        self.set_scan_state(1)
+        global local_accumulator
+        local_accumulator = 0
+        print("Unlocked - Scanning")
+    
+    def gain_p(self,p_gain):
+        """ Set the proportional gain. Use a positive gain to lock to a positive slope error signal.  """
+        self.params[1] = p_gain
+        self.set_params()
+        print("Proportional gain updated to:" + str(p_gain))
+    
+    def gain_i(self,i_gain):
+        """ Set the integral gain """
+        self.params[2] = i_gain
+        self.set_params()
+        print("Integral gain updated to:" + str(i_gain))
+    
+    def gain_i2(self,i2_gain):
+        """ Set the integral^2 gain """
+        self.params[3] = i2_gain
+        self.set_params()
+        print("Integral^2 gain updated to:" + str(i2_gain))
+    
+    def output_offset(self,offset):
+        """ Set the output offset in V """
+        self.params[4] = int(ToBits(offset)+ZEROV)
+        self.set_params()
+    
+    def increase_offset(self):
+        self.params[4] += int(ToBits(0.1))
+        self.set_params()
+    
+    def decrease_offset(self):
+        self.params[4] -= int(ToBits(0.1))
+        self.set_params()
+    
+    def fwhm(self,new_fwhm):
+        self.params[7] = new_fwhm
+        self.set_params()
+    
+    def n_averages(self,new_n):
+        self.params[9] = new_n
+        self.set_params()
 
-def lock():
-    global p_state,i_state,i2_state
-    cslock.set_scan_state(0)
-    lockpoint = ToVoltage(int(cslock.ser.readline())-ZEROV)
-    print(lockpoint)
-    print("Locked")
-    cslock.get_params()
-
-def unlock():
-    cslock.set_scan_state(1)
-    global local_accumulator
-    local_accumulator = 0
-    print("Unlocked - Scanning")
-
-def gain_p( p_gain):
-    """ Set the proportional gain. Use a positive gain to lock to a positive slope error signal.  """
-    cslock.params[1] = p_gain
-    cslock.set_params()
-    print("Proportional gain updated to:" + str(p_gain))
-
-def gain_i(i_gain):
-    """ Set the integral gain """
-    cslock.params[2] = i_gain
-    cslock.set_params()
-    print("Integral gain updated to:" + str(i_gain))
-
-def gain_i2(i2_gain):
-    """ Set the integral^2 gain """
-    cslock.params[3] = i2_gain
-    cslock.set_params()
-    print("Integral^2 gain updated to:" + str(i2_gain))
-
-def output_offset(offset):
-    """ Set the output offset in V """
-    cslock.params[4] = int(ToBits(offset)+ZEROV)
-    cslock.set_params()
-
-def increase_offset():
-    cslock.params[4] += int(ToBits(0.1))
-    cslock.set_params()
-
-def decrease_offset():
-    cslock.params[4] -= int(ToBits(0.1))
-    cslock.set_params()
-
-def fwhm(new_fwhm):
-    cslock.params[7] = new_fwhm
-    cslock.set_params()
+    def low_pass(self,new_lp):
+        """ Change low-pass cutoff frequency in Hz """
+        del_t = 1e-6*(10.9*self.params[9]+20.6) #s
+        rc = 1.0/new_lp
+        alpha = del_t/(rc+del_t)
+        self.params[10] = alpha
+        self.set_params()
+        print("Low-pass cutoff changed to %.0f Hz (alpha= %.3f)"%(new_lp,alpha))
+        
 
 #def scan_freq_nsteps(n_steps):
 #    """ Set the number of steps"""
@@ -299,7 +335,7 @@ def fwhm(new_fwhm):
 #if __name__ == '__main__':
 #    cslock = CsLock()
 
-cslock = CsLock()
+#cslock = CsLock()
 
 # loop_running = True
 # local_accumulator = 0

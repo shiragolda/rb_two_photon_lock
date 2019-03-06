@@ -24,10 +24,10 @@
 #define STATE_LOCKING 0
 #define STATE_SCANNING 1
 
-#define ACCUMULATOR2_MAX 2000 //when accumulator is greater than this may be out of lock - code will pause accumulator
-#define ACCUMULATOR1_MAX 800
+#define ACCUMULATOR2_MAX 2000 //when accumulator is greater than this may be out of lock - code will auto relock
 
-#define INTEGRATOR_HOLD_TIME 500000  // microseconds - how long to pause accumulator for
+#define OUTPUT_MAX 49512 //4V
+#define OUTPUT_MIN 16385 //-4V
 
 struct Params {
   float ramp_amplitude;
@@ -37,30 +37,29 @@ struct Params {
   float ramp_frequency;
   float fwhm;
   long lock_point;
+  long n_averages;
+  float alpha;
 };
 
 Params params;
 
+Params temp_buffer;
+
 long in0;
-long out0, out1, out2;
+long out0;
+
+long lock_start_voltage;
 
 float half_period;
 float ramp_slope;
 
-bool ramp_direction;
-long ramp_offset;
 float error_signal;
 float accumulator;
 float accumulator2;
-bool pause_accumulator;
-long pause_time;
 
-long loop_counter = 0;
-
-
-bool write_to_serial_on_unlock;
-bool serial_log;
-
+int get_sampling_rate = 0;
+long start_time = 0;
+long sampling_time = 0;
 
 float ToVoltage(float bits) {
   return (bits-32768)/6553.6;
@@ -79,8 +78,6 @@ void setup() {
   in0 = ZEROV;
   
   out0 = ZEROV;
-  out1 = ZEROV;
-  out2 = ZEROV;
 
   params.ramp_amplitude = 1.0; //volts
   params.gain_i = 10000; // integral gain
@@ -91,29 +88,46 @@ void setup() {
 
   params.fwhm = 0.02; //V
   params.lock_point = ToBits(1.5); //V
+
+  params.n_averages = 4;
   
   accumulator = 0.0; //will pause accumulation if gets too big (sudden jump to laser, such as bang on optics table)
   accumulator2 = 0.0; //will not pause, used for i^2 gain
   
   params.scan_state = STATE_SCANNING; //code is in scan mode / lock mode
   params.ramp_frequency = 20; // Hz
+
+  params.alpha = 0.05; 
+  lock_start_voltage = ZEROV;
   
   processParams();
   error_signal = ZEROV;//0.0;
 
-  pause_accumulator = true;
-  serial_log = false;
+}
 
+long limitOutput(long output) {
+  long new_output;
+  if(output>OUTPUT_MAX){
+    new_output = OUTPUT_MAX;
+  }
+  else if(output<OUTPUT_MIN) {
+    new_output = OUTPUT_MIN;
+  }
+  else {
+    new_output = output;
+  }
+  return new_output;
 }
 
 void processParams() {
   ramp_slope = 4*params.ramp_amplitude*params.ramp_frequency*0.000001; // V/us
   half_period = 1000000/(2*params.ramp_frequency); // us
-  accumulator = 0.0;
-  accumulator2=0.0;
+  //accumulator = 0.0;
+  //accumulator2=0.0;
   if(params.scan_state==STATE_LOCKING){
+    accumulator = 0.0;
+    accumulator2=0.0;
     rampCycle(true);
-    Serial.println(params.lock_point);
   }
 }
 void rampCycle(bool find_lock_point) {
@@ -123,15 +137,14 @@ void rampCycle(bool find_lock_point) {
 
   long sig_in;
   long max_sig = 0;
-  long max_sig_out = params.output_offset;
-  float lock_point_offset = ZEROV;
+  long max_sig_out = lock_start_voltage;
   
   start_time = micros();
   ramp_time = 0;
   while(ramp_time<half_period){
     ramp_time = micros() - start_time;
     out0 = ToBits(ramp_slope*ramp_time - params.ramp_amplitude + offset);
-    analog.write(0,out0); 
+    analog.write(0,limitOutput(out0)); 
 
     if(find_lock_point){
       sig_in = analog.read(0,false);
@@ -147,87 +160,82 @@ void rampCycle(bool find_lock_point) {
   while(ramp_time<half_period){
     ramp_time = micros() - start_time;
     out0 = ToBits(-ramp_slope*ramp_time + params.ramp_amplitude + offset);
-    analog.write(0,out0); 
+    analog.write(0,limitOutput(out0)); 
   }
 
   if(find_lock_point){
-    //lock_point= ToBits(1.5) ;//ToVoltage(max_sig)/2);
-    lock_point_offset = max_sig_out-(ToBits(5*params.fwhm)-ZEROV);
-    params.output_offset =lock_point_offset; //lock_point_offset;
+    lock_start_voltage = max_sig_out-(ToBits(params.fwhm)-ZEROV);
+    //params.output_offset -= ToBits(-params.ramp_amplitude)-ZEROV;
+    //Serial.println(lock_start_voltage);
+
   }
 }
 
 void loop() {
-  loop_counter += 1;
+
+    
   if(Serial.available()){
     parseSerial();
-    //analog.write(0,params.output_offset);
   }
-    
-  in0 = analog.read(0, false); //read the voltage on channel 0
-
-  float err_curr = ((float)(in0 - params.lock_point)); //current signal reading, in ??... in0 and lock_point are both in Bits
-  error_signal = 0.95*error_signal + 0.05*err_curr; //low-passed error signal, in V
-  
-  out0 = ZEROV;
-  out0 = params.output_offset; //add voltage offset to piezo
+  if(get_sampling_rate==1){
+    start_time = micros();
+  }
 
   // -----------------------------------------------------------------
   if(params.scan_state == STATE_SCANNING) {
-
     rampCycle(false);
-
   }
+  
   // -------------------------------------------------------------------
   if(params.scan_state == STATE_LOCKING) {
-  
-    if(!pause_accumulator) { //...and the accumulator is not paused for a signal spike
-       accumulator += params.gain_i*error_signal; //add the integral gain term to the accumulator
-       accumulator2 += params.gain_i2*accumulator; //add the integral squared term to the accumualator2
-    }
-    if(abs(accumulator) > ACCUMULATOR1_MAX and !pause_accumulator) { //if the accumulator is too big, pause the accumulation!
-      pause_accumulator = true;
-      pause_time = micros();
-    }
+    /*
+    in0 = analog.read(0, false); //read the voltage on channel 0
+
+    float err_curr = ((float)(in0 - params.lock_point)); //current signal reading, in ??... in0 and lock_point are both in Bits
+    error_signal = 0.95*error_signal + 0.05*err_curr; //low-passed error signal, in V
+    */
     
+    
+    in0 = 0;
+    for(int i=0;i<params.n_averages;i++){
+      in0+=analog.read(0,false)/params.n_averages;
+    }
+    float err_curr = ((float)(in0-params.lock_point));
+    error_signal = (1-params.alpha)*error_signal + params.alpha*err_curr; //low-passed error signal, in V
+    
+    
+    out0 = lock_start_voltage; //add voltage offset to piezo
+  
+    accumulator += params.gain_i*error_signal; //add the integral gain term to the accumulator
+    accumulator2 += params.gain_i2*accumulator; //add the integral squared term to the accumualator2
+
+    //AUTO RELOCK:
     if(abs(accumulator2) > ACCUMULATOR2_MAX) { //if accumulator 2 gets too big, out of lock
       // this could mean that we are out of lock... reset
-      //params.scan_state = STATE_SCANNING; //return to scanning mode
-      if(write_to_serial_on_unlock) { //send an "out of lock" message to the serial
-        Serial.write('1');
-      }
+      lock_start_voltage = ZEROV;
       processParams();
-      
-    }
-    if(pause_accumulator) { //if the accumulator is paused
-      if(micros() - pause_time > INTEGRATOR_HOLD_TIME) { //wait until the integrator hold time has passed
-        pause_accumulator = false;
-        accumulator *= 0.9; //reset the accumulator
-      }
     }
   
    out0 -= params.gain_p*error_signal+accumulator2+accumulator; // note the overall sign on the gain
+   analog.write(0,limitOutput(out0));  //WRITE OUT THE CORRECTION SIGNAL
+
+ 
+
   }
+  
   // -----------------------------------------------------------------
   
   /* Output voltages are the following: 
-   *  out0 = V_Poff + V_ramp    in scanning mode
    *  out0 = V_Poff - accumulator 2 - accumulator1 - Pp*error     offset, proportional gain, integral gain, integral^2 gain
    *  
    *  accumulator1: accumulate I*error
    *  accumulator2: accumulate I2*accumulator1
    */
-  
-  analog.write(0,out0);  //WRITE OUT THE CORRECTION SIGNAL
-
-
-  /*Write to serial for data logging in python */
-  if(serial_log && loop_counter%50000 == 0) {
-    Serial.print(((float)(in0 - ZEROV))/6553.6,4); //V
-    Serial.print(',');
-    Serial.println(((float)(out0 - ZEROV))/6553.6,4); //V
-  }
-
+   if(get_sampling_rate==1){
+    sampling_time = micros() - start_time;
+    Serial.println(sampling_time);
+    get_sampling_rate=0;
+   }
 }
 
 /*
@@ -259,13 +267,18 @@ void parseSerial() { //function to read and interpret characters passed from the
       break;
     case 's':
       // set params struct
-      Serial.readBytes((char *) &params, sizeof(Params));
-      processParams(); //update the parameters as they've been changed in the python interface
+      Serial.readBytes((char *) &temp_buffer, sizeof(Params));
+      if(temp_buffer.scan_state<=1 && temp_buffer.scan_state>=0){ //sanity check - make sure nothing went wrong in receiving the data
+        params = temp_buffer;
+        processParams(); //update the parameters as they've been changed in the python interface
+        Serial.println("Success");
+      }
+      else {
+        Serial.println("Inappropriate data fetched");
+      }
       break;
-    case 'm':
-      // toggle serial log
-      serial_log = !serial_log;
-      break;
+    case 't':
+      get_sampling_rate = 1;
   }
 }
 
